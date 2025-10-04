@@ -1,0 +1,107 @@
+/**** USER PARAMS ****/
+var ASSET_ID     = table
+var START_DATE   = '2025-03-01';
+var END_DATE     = '2025-12-31';
+var BUFFER_METERS = 50;   // e.g., 50 m buffer around each point
+var MAX_CLOUD_PCT = 5;   // filter out very cloudy scenes at metadata level
+var EXPORT_DESC   = 'NDCI_points_buffer';
+var EXPORT_FOLDER = null; // or set to a Drive folder name as a string
+
+// /**** LOAD & PREPARE POINTS (APPLY BUFFER) ****/
+var points = ee.FeatureCollection(ASSET_ID);
+
+// // Keep original properties and replace geometry with buffered geometry
+var bufferedPoints = points.map(function (f) {
+  return f.setGeometry(f.geometry().buffer(BUFFER_METERS));
+});
+
+// Quick visualization
+Map.centerObject(points, 12);
+Map.addLayer(points,          {color: 'blue'}, 'Original points');
+Map.addLayer(bufferedPoints,  {color: 'red'},  'Buffered polygons');
+
+// // If you have a unique ID property on your points (e.g., "site_id"), set it here for clarity:
+var ID_PROP = 'id'; // or change to your property name; if none, you can leave as is
+// // If your points don’t have this property, you can auto-assign one:
+// // bufferedPoints = bufferedPoints.map(function(f){return f.set('site_id', f.id());});
+
+/**** SENTINEL-2 SR COLLECTION + CLOUD MASKING ****/
+function maskS2SR(image) {
+  // QA60 bits 10 (clouds) and 11 (cirrus) should be 0 for clear pixels
+  var qa = image.select('QA60');
+  var cloudBit = 1 << 10;
+  var cirrusBit = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBit).eq(0).and(qa.bitwiseAnd(cirrusBit).eq(0));
+
+//   // Scale reflectance to 0–1 and apply mask
+  return image.updateMask(mask).divide(10000)
+              .copyProperties(image, ['system:time_start', 'CLOUDY_PIXEL_PERCENTAGE']);
+}
+
+function addNDCI(image) {
+  // NDCI = (RedEdge705 - Red) / (RedEdge705 + Red) = (B5 - B4) / (B5 + B4)
+  var ndci = image.normalizedDifference(['B5', 'B4']).rename('NDCI');
+  return image.addBands(ndci).copyProperties(image, ['system:time_start']);
+}
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(bufferedPoints)
+  .filterDate(START_DATE, END_DATE)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', MAX_CLOUD_PCT))
+  .map(maskS2SR)
+  .map(addNDCI)
+  .select('NDCI');
+
+// How many images made it through your filters?
+print('S2 images kept:', s2.size());
+
+// Quick peek at dates (first 10)
+var dates = s2.aggregate_array('system:time_start')
+  .map(function(t){ return ee.Date(t).format('YYYY-MM-dd'); });
+print('First 10 dates:', dates.slice(0, 10));
+
+// (Optional) Look at scene-level cloud % for those same images
+var clouds = s2.aggregate_array('CLOUDY_PIXEL_PERCENTAGE');
+print('Cloud % (first 10):', clouds.slice(0, 10));
+
+/**** REDUCE NDCI OVER EACH BUFFER FOR EACH IMAGE ****/
+// For each image, reduce NDCI over all buffered points (mean, stdDev, count).
+var perImageReductions = s2.map(function (img) {
+  var dateStr = ee.Date(img.get('system:time_start')).format('YYYY-MM-dd');
+  var reduced = img.reduceRegions({
+    collection: bufferedPoints,
+    reducer: ee.Reducer.mean()
+              .combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true})
+              .combine({reducer2: ee.Reducer.count(),  sharedInputs: true}),
+    scale: 10,     // Sentinel-2 native resolution for B4/B5 is 10 m (B5 is 20 m in L1C, but SR_HARMONIZED provides resampled bands)
+    tileScale: 2   // increase if you hit memory issues
+  });
+
+  // Attach image date and (optionally) image-level cloudiness as properties
+  reduced = reduced.map(function (f) {
+    return f.set({
+      img_date: dateStr,
+      img_cloud_pct: img.get('CLOUDY_PIXEL_PERCENTAGE')
+    });
+  });
+  return reduced;
+});
+
+// Flatten to one FeatureCollection (rows: point x image date)
+var ndciTimeSeries = perImageReductions.flatten();
+
+// /**** OPTIONAL: QUICK MAP VIEW ****/
+// // Map.centerObject(bufferedPoints, 12);
+// // Map.addLayer(bufferedPoints, {color: 'red'}, 'Buffered Points');
+// // Map.addLayer(
+// //   s2.median().select('NDCI'),
+// //   {min: -1, max: 1},
+// //   'Median NDCI (period)'
+// // );
+
+/**** EXPORT TO DRIVE ****/
+// The export will include original point properties + NDCI_mean, NDCI_stdDev, NDCI_count, img_date, img_cloud_pct
+Export.table.toDrive({
+  collection: ndciTimeSeries,
+  description: 'NDCI values in buffer polygons'
+});
