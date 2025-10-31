@@ -1,0 +1,93 @@
+print(table.limit(5))
+
+var withGeometry = table.map(function(feature) {
+  var lon = feature.getNumber('lon');
+  var lat = feature.getNumber('lat');
+  var point = ee.Geometry.Point([lon, lat]);
+  return feature.setGeometry(point);
+});
+
+// 3. Display on the map
+Map.addLayer(withGeometry, {}, 'Sites');
+Map.centerObject(withGeometry);
+
+// 2) Convert dates into millis
+// expected data format of my sample dates, so GEE knows how to interpret them:
+var fmt = 'dd/MM/YYYY'; 
+//applying a .map function to tranform each element of my sample dates table
+var samplesFC = table.map(function(f) {
+//grabs sample date values, turns it into a string and trims any accidental blank spaces
+  var dstr = ee.String(f.get('Date_Sample_Collected')).trim();
+//checks if string length is greater than zero, and assigns 'null' to any blank rows
+  var dt = ee.Algorithms.If(dstr.length().gt(0),
+                            ee.Date.parse(fmt, dstr),
+                            null);
+//ensures that the resulting dt variable has a date format
+  dt = ee.Date(dt);
+//.set() keeps old attributes and adds new ones (date in sample_date_parsed and millis)
+  return f.set({
+    sample_date_parsed: dt.format('YYYY-MM-dd'),
+    t: dt.millis()  //
+  });
+}).filter(ee.Filter.notNull(['t'])); // "keep only rows where the property t is not null"
+
+print('Parsed sample dates:', samplesFC.limit(5));
+
+
+// ---------------------- 2) SENTINEL-2 COLLECTION ----------------------
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(withGeometry)
+  .filterDate('2024-01-01', '2025-09-30')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 50));
+
+
+// ---------------------- 3) NEAREST-IN-TIME JOIN ----------------------
+// Define a big window variable (10 years), converted into milliseconds
+var BIG_WINDOW_MS = ee.Number(3650) // 10 years
+  .multiply(24*60*60*1000);
+//ee.Filter.maxDifference() builds a filter that pairs 2 items only if their time gap is ≤ difference.
+var diffFilter = ee.Filter.maxDifference({
+  difference: BIG_WINDOW_MS,
+  leftField: 't',                     // from CSV rows
+  rightField: 'system:time_start'     // from S2 images
+});
+//
+var saveBest = ee.Join.saveBest({
+  matchKey: 'nearest',   // property on each CSV feature holding the best image
+  measureKey: 'timeDiff' // property with the absolute time diff in ms
+});
+
+var matched = saveBest.apply(samplesFC, s2, diffFilter); //the resulting feature collection, with 2 new properties
+print('Matched sample dates:', matched.limit(5));
+
+
+// ---------------------- 4) BUILD A CLEAN RESULT TABLE ----------------------
+//this builds a new collection based on looping a function through each element of the matched collection
+var result = ee.FeatureCollection(matched.map(function(f) {
+//retrieves each 'nearest' sentinel image and converts it into an Image object
+  var img = ee.Image(f.get('nearest'));
+//retrieves 'system:time_start' from each Sentinel image and turns it into a Date object
+  var imgDate = ee.Date(img.get('system:time_start'));
+//retrieves time gap between sample and matched image (milliseconds) and turns it into a Number object
+  var diffMs = ee.Number(f.get('timeDiff'));
+//converts time gap from milliseconds to days values
+  // var diffDays = diffMs.divide(24*60*60*1000);
+    return ee.Feature(f.geometry(), f.toDictionary()) // null means there is no geometry; f.toDictionary() copies original CSV columns
+//.set() adds new properties from Sentinel image: unique id, image acquisition date, cloud percentage, time gap in days    
+    .set({
+      image_id: img.id(),
+      image_date: imgDate.format('YYYY-MM-dd'),
+      cloud_pct: img.get('CLOUDY_PIXEL_PERCENTAGE'),
+      time_diff_days: diffMs
+    });
+}));
+
+
+print('Nearest S2 image per CSV row:', result.limit(20));
+print(result.size())
+// ---------------------- 6) OPTIONAL EXPORT ----------------------
+Export.table.toDrive({
+  collection: result,
+  description: 'S2_nearest_to_sample_dates_from_CSV',
+  fileFormat: 'CSV'
+});
