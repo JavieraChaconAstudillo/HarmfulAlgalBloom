@@ -1,0 +1,95 @@
+// 0) Inputs
+var inputBands = ['NDCI'];
+var label = 'cells';
+
+// 1) Create numeric label from your original column
+var samples = table2.map(function(f){
+  var cellsNum = ee.Number.parse(ee.String(f.get('Results_CellperLiter')));
+  return f.set('cells', cellsNum);
+});
+
+// 2) Filter and (optionally) log-transform
+samples = samples
+  .filter(ee.Filter.notNull([label]))
+  .filter(ee.Filter.gte(label, 0));
+
+var useLog = true;
+if (useLog) {
+  samples = samples.map(function(f){
+    return f.set('cells_log', ee.Number(f.get('cells')).add(1).log10());
+  });
+  label = 'cells_log';
+}
+
+// 3) Ensure predictors exist for every row
+samples = samples.filter(ee.Filter.notNull(inputBands));
+
+// 4) Keep only geometry + predictors + label
+samples = samples.select(inputBands.concat([label]));
+
+// 5) Split into training / validation
+samples = samples.randomColumn('rand', 42);
+var training   = samples.filter(ee.Filter.lt('rand', 0.8));
+var validation = samples.filter(ee.Filter.gte('rand', 0.8));
+
+// 6) Train Random Forest Classifier in REGRESSION mode
+var model = ee.Classifier.smileRandomForest({
+  numberOfTrees: 200,
+  seed: 0
+}).setOutputMode('REGRESSION')
+  .train({
+    features: training,
+    classProperty: label,
+    inputProperties: inputBands
+  });
+
+// 7) Predict on both training and validation sets
+var predName = 'pred';
+var predictedTrain = training.classify(model, predName);
+var predictedVal   = validation.classify(model, predName);
+
+// 8) Quick diagnostics
+print('Training n =', training.size());
+print('Validation n =', validation.size());
+print('One sample:', samples.first());
+print('Model details:', model.explain());
+
+// 9) Scatter: Observed vs Predicted
+var yObs = label; // either 'cells' or 'cells_log'
+print(ui.Chart.feature.byFeature(predictedVal, yObs, [predName])
+  .setOptions({
+    title: 'Observed vs Predicted (validation)',
+    hAxis: {title: 'Observed ' + yObs},
+    vAxis: {title: 'Predicted ' + yObs},
+    pointSize: 4
+  })
+);
+
+//
+var obs = ee.Array(predictedVal.aggregate_array(yObs));
+var pred = ee.Array(predictedVal.aggregate_array(predName));
+var len = obs.length().get([0]);              // number of elements
+
+var meanObsArr = ee.Array([obs.reduce('mean', [0]).get([0])]); // [μ]
+var meanVec    = ee.Array.cat(ee.List.repeat(meanObsArr, len), 0); // [μ, μ, ..., μ] length=len
+
+var ssTot = obs.subtract(meanVec).pow(2).reduce('sum', [0]).get([0]);
+var ssRes = obs.subtract(pred).pow(2).reduce('sum', [0]).get([0]);
+
+var r2   = ee.Number(1).subtract(ssRes.divide(ssTot));
+var rmse = ee.Number(ssRes).divide(len).sqrt();
+
+print('R² (validation):', r2);
+print('RMSE (validation, units of ' + yObs + '):', rmse);
+
+
+// 11) Variable importance
+print('Variable importance:', model.explain().get('importance'));
+
+// 12) Export predictions (optional)
+Export.table.toDrive({
+  collection: predictedVal,
+  description: 'RF_validation_results',
+  fileFormat: 'CSV',
+  selectors: inputBands.concat([yObs, predName])
+});
