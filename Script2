@@ -1,0 +1,113 @@
+var points = table
+print('Number of samples', points.size())
+print('Preview', points.limit(5))
+// 1. Sentinel-2 SR Harmonized collection
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+// 2. Create point geometries from the lat/lon properties
+var withGeometry = points.map(function(feature) {
+  var lon = feature.getNumber('lon');
+  var lat = feature.getNumber('lat');
+  var point = ee.Geometry.Point([lon, lat]);
+  return feature.setGeometry(point);
+});
+
+// 3. Display on the map
+Map.addLayer(withGeometry, {}, 'Sites');
+Map.centerObject(withGeometry);
+
+print('Sample Points', withGeometry.limit(5))
+
+var BUFFER_METERS = 60; // try larger than 30
+
+// var BUFFER_METERS = 30;   // ~1–2 Sentinel-2 pixels
+//mask + indices
+function maskSCL(img) {
+  var scl = img.select('SCL');
+  var good = scl.neq(3).and(scl.neq(8)).and(scl.neq(9))
+                .and(scl.neq(10)).and(scl.neq(11));
+  return img.updateMask(good);
+}
+// --- Add indices at 10 m (Sentinel-2) ---
+function addIndices(img) {
+  var m = maskSCL(img);
+
+  // // Upsample 20 m bands to 10 m so math with 10 m bands is clean
+  // // (B5, B6, B11 are 20 m in S2_SR_HARMONIZED)
+  // m = m.addBands(m.select(['B5','B6','B11']).resample('bilinear'), null, true);
+
+  // Core indices
+  var ndci  = m.normalizedDifference(['B5','B4']).rename('NDCI');
+  var mndwi = m.normalizedDifference(['B3','B11']).rename('MNDWI');
+  var ndvi  = m.normalizedDifference(['B8','B4']).rename('NDVI');
+
+  // Turbidity proxies
+  var turb_gr      = m.select('B3').divide(m.select('B4')).rename('TUR_G_R');        // Green/Red
+  var turb_swirnir = m.select('B11').divide(m.select('B8')).rename('TUR_SWIR_NIR');  // SWIR/NIR
+
+  // Red-edge ratios
+  var rer1 = m.select('B5').divide(m.select('B4')).rename('RER1'); // RE1/Red
+  var rer2 = m.select('B6').divide(m.select('B5')).rename('RER2'); // RE2/RE1
+
+  // Floating Algae Index (FAI) for S2
+  // Wavelengths (nm): Red=665, NIR=842, SWIR=1610
+  var red  = m.select('B4');
+  var nir  = m.select('B8');
+  var swir = m.select('B11');
+  var red_w = 665, nir_w = 842, swir_w = 1610;
+  var baseline = red.add(
+      swir.subtract(red)
+          .multiply((nir_w - red_w) / (swir_w - red_w))
+  );
+  var fai = nir.subtract(baseline).rename('FAI');
+
+  return m.addBands([ndci, mndwi, ndvi, turb_gr, turb_swirnir, rer1, rer2, fai]);
+}
+
+// --- Property list to extract ---
+var indexList = ['NDCI','MNDWI','NDVI','TUR_G_R','TUR_SWIR_NIR','RER1','RER2','FAI'];
+
+// Seed properties so export always contains these columns
+var seeded = withGeometry.map(function(f) {
+  return f.setMulti({
+    NDCI: null, MNDWI: null, NDVI: null,
+    TUR_G_R: null, TUR_SWIR_NIR: null,
+    RER1: null, RER2: null, FAI: null
+  });
+});
+
+
+var withIndices = seeded.map(function(f){
+  var sysIndex = ee.String(f.get('image_id')).trim();
+  var img = ee.Image(s2.filter(ee.Filter.eq('system:index', sysIndex)).first());
+  var found = img.bandNames().size().gt(0);
+  var geom = f.geometry().buffer(BUFFER_METERS);
+
+  return ee.Feature(ee.Algorithms.If(found, (function(){
+      var im = addIndices(img);
+
+      var stats = im.select(indexList).reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: geom,
+        scale: 10,
+        maxPixels: 1e8,
+        bestEffort: true
+      });
+
+      return f.set({ image_id: sysIndex, _note: '' })
+              .setMulti(stats);  // props: NDCI,MNDWI,...
+    })(),
+    f.set({
+      image_id: sysIndex,
+      _note: 'image not found in COPERNICUS/S2_SR_HARMONIZED'
+    })
+  ));
+});
+
+// export with plain names (no _median)
+Export.table.toDrive({
+  collection: withIndices,
+  description: 'points_with_indices',
+  fileFormat: 'CSV',
+  selectors: ['image_id','Station','image_date','Results_CellperLiter','Species_Group','Result_Name','lat','lon',
+              'NDCI','MNDWI','NDVI','TUR_G_R','TUR_SWIR_NIR','RER1','RER2','FAI','_note']
+});
